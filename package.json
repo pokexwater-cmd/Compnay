@@ -1,0 +1,13 @@
+{
+  "name": "openai-companion-proxy",
+  "version": "1.0.0",
+  "main": "openai-proxy-server.js",
+  "scripts": {
+    "start": "node openai-proxy-server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0"
+  }
+}
