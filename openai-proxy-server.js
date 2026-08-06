@@ -14,16 +14,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Catch malformed JSON bodies and return a clean JSON error instead of
-// letting Express fall back to an HTML error page (which broke the client's
-// JSON.parse before).
-app.use((err, req, res, next) => {
-  if (err.type === "entity.parse.failed") {
-    return res.status(400).json({ error: "Invalid JSON in request body." });
-  }
-  next(err);
-});
-
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = "gemini-flash-latest";
 
@@ -256,8 +246,18 @@ function callMistral(system, messages, max_tokens) {
 }
 
 // ---------- Routes ----------
+// Every route below is wrapped so ANY thrown error — sync or async —
+// ends up as JSON, never Express's default HTML error page. That HTML
+// page (starting with <!DOCTYPE) is exactly what was breaking the
+// client's JSON.parse().
 
-app.post("/chat", async function (req, res) {
+function asyncRoute(handler) {
+  return function (req, res, next) {
+    Promise.resolve(handler(req, res, next)).catch(next);
+  };
+}
+
+app.post("/chat", asyncRoute(async function (req, res) {
   let system = req.body.system;
   let messages = req.body.messages;
   const max_tokens = req.body.max_tokens;
@@ -338,15 +338,15 @@ app.post("/chat", async function (req, res) {
   }
 
   return res.status(500).json({ error: "All providers failed. " + errors.join(" | ") });
-});
+}));
 
-app.get("/history", async function (req, res) {
+app.get("/history", asyncRoute(async function (req, res) {
   const userId = req.query.user_id || "default_user";
   const history = await fetchHistory(userId, 100);
   res.json({ history: history });
-});
+}));
 
-app.get("/health", async function (req, res) {
+app.get("/health", asyncRoute(async function (req, res) {
   const results = {};
   const testMsg = [{ role: "user", content: "Say OK" }];
 
@@ -416,6 +416,24 @@ app.get("/health", async function (req, res) {
   }
 
   res.json(results);
+}));
+
+// ---------- Catch-all error handler ----------
+// MUST be registered after every route above — that's the only position
+// where Express will route a route-handler's thrown/rejected error here.
+// This guarantees the client NEVER receives an HTML error page again.
+app.use(function (err, req, res, next) {
+  console.error("Unhandled error on", req.method, req.path, ":", err && err.stack ? err.stack : err);
+  if (err && err.type === "entity.parse.failed") {
+    return res.status(400).json({ error: "Invalid JSON in request body." });
+  }
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: (err && err.message) ? err.message : "Internal server error." });
+});
+
+// 404s should be JSON too, not Express's default HTML "Cannot GET /x" page
+app.use(function (req, res) {
+  res.status(404).json({ error: "Not found: " + req.method + " " + req.path });
 });
 
 const PORT = process.env.PORT || 3000;
