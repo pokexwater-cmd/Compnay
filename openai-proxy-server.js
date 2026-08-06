@@ -11,7 +11,7 @@ app.use(cors());
 app.use(express.json());
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_MODEL = "gemini-flash-latest";
 
 if (!GEMINI_API_KEY) {
   console.error("Missing GEMINI_API_KEY environment variable.");
