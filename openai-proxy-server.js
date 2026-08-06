@@ -14,6 +14,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Catch malformed JSON bodies and return a clean JSON error instead of
+// letting Express fall back to an HTML error page (which broke the client's
+// JSON.parse before).
+app.use((err, req, res, next) => {
+  if (err.type === "entity.parse.failed") {
+    return res.status(400).json({ error: "Invalid JSON in request body." });
+  }
+  next(err);
+});
+
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = "gemini-flash-latest";
 
@@ -253,7 +263,6 @@ app.post("/chat", async function (req, res) {
   const max_tokens = req.body.max_tokens;
   const userId = req.body.user_id || "default_user";
 
-  // If no history was sent by the client, try loading it from Supabase
   if ((!messages || messages.length === 0) && SUPABASE_URL && SUPABASE_KEY) {
     const stored = await fetchHistory(userId, 50);
     messages = stored.map(function (m) {
@@ -331,14 +340,12 @@ app.post("/chat", async function (req, res) {
   return res.status(500).json({ error: "All providers failed. " + errors.join(" | ") });
 });
 
-// Fetch stored history for a user
 app.get("/history", async function (req, res) {
   const userId = req.query.user_id || "default_user";
   const history = await fetchHistory(userId, 100);
   res.json({ history: history });
 });
 
-// Visit /health in your browser to test all providers at once
 app.get("/health", async function (req, res) {
   const results = {};
   const testMsg = [{ role: "user", content: "Say OK" }];
