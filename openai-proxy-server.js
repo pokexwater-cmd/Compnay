@@ -30,6 +30,10 @@ if (!GEMINI_API_KEY) {
   console.error("Missing GEMINI_API_KEY environment variable.");
   process.exit(1);
 }
+if (!GROQ_API_KEY) console.warn("Missing GROQ_API_KEY — that fallback step will be skipped.");
+if (!OPENROUTER_API_KEY) console.warn("Missing OPENROUTER_API_KEY — that fallback step will be skipped.");
+if (!MISTRAL_API_KEY) console.warn("Missing MISTRAL_API_KEY — that fallback step will be skipped.");
+if (!CRICKET_API_KEY) console.warn("Missing CRICKET_API_KEY — cricket data injection will be skipped.");
 
 function isCricketQuery(text) {
   if (!text) return false;
@@ -111,90 +115,4 @@ async function callGemini(system, messages, max_tokens) {
 
 // Generic helper for OpenAI-compatible chat APIs (Groq, OpenRouter, Mistral)
 async function callOpenAiCompatible(url, apiKey, model, system, messages, max_tokens, extraHeaders) {
-  const chatMessages = [
-    { role: "system", content: system || "" },
-    ...(messages || []).map((m) => ({
-      role: m.role === "assistant" ? "assistant" : "user",
-      content: m.content,
-    })),
-  ];
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-      ...(extraHeaders || {}),
-    },
-    body: JSON.stringify({ model, messages: chatMessages, max_tokens: max_tokens || 1200 }),
-  });
-
-  const data = await response.json();
-  if (data.error) throw new Error(data.error.message || data.error || "API error");
-
-  const choice = data.choices && data.choices[0];
-  return choice && choice.message ? (choice.message.content || "").trim() : "";
-}
-
-const callGroq = (system, messages, max_tokens) =>
-  callOpenAiCompatible("https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY, GROQ_MODEL, system, messages, max_tokens);
-
-const callOpenRouter = (system, messages, max_tokens) =>
-  callOpenAiCompatible("https://openrouter.ai/api/v1/chat/completions", OPENROUTER_API_KEY, OPENROUTER_MODEL, system, messages, max_tokens);
-
-const callMistral = (system, messages, max_tokens) =>
-  callOpenAiCompatible("https://api.mistral.ai/v1/chat/completions", MISTRAL_API_KEY, MISTRAL_MODEL, system, messages, max_tokens);
-
-app.post("/chat", async (req, res) => {
-  let { system, messages, max_tokens } = req.body;
-
-  const lastUserMsg = [...(messages || [])].reverse().find((m) => m.role === "user");
-  if (lastUserMsg && isCricketQuery(lastUserMsg.content)) {
-    const cricketInfo = await fetchCricketContext();
-    if (cricketInfo) {
-      system = `${system || ""}\n\nLive cricket data (use this if relevant to the user's question, current as of now):\n${cricketInfo}`;
-    }
-  }
-
-  const errors = [];
-
-  try {
-    const reply = await callGemini(system, messages, max_tokens);
-    return res.json({ reply, provider: "gemini" });
-  } catch (e) {
-    errors.push(`Gemini: ${e.message}`);
-    if (e.isSafetyBlock) return res.status(500).json({ error: e.message });
-  }
-
-  if (GROQ_API_KEY) {
-    try {
-      const reply = await callGroq(system, messages, max_tokens);
-      return res.json({ reply, provider: "groq" });
-    } catch (e) {
-      errors.push(`Groq: ${e.message}`);
-    }
-  }
-
-  if (OPENROUTER_API_KEY) {
-    try {
-      const reply = await callOpenRouter(system, messages, max_tokens);
-      return res.json({ reply, provider: "openrouter" });
-    } catch (e) {
-      errors.push(`OpenRouter: ${e.message}`);
-    }
-  }
-
-  if (MISTRAL_API_KEY) {
-    try {
-      const reply = await callMistral(system, messages, max_tokens);
-      return res.json({ reply, provider: "mistral" });
-    } catch (e) {
-      errors.push(`Mistral: ${e.message}`);
-    }
-  }
-
-  return res.status(500).json({ error: `All providers failed. ${errors.join(" | ")}` });
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Proxy listening on port ${PORT}`));
+  con
