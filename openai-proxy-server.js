@@ -1,7 +1,8 @@
 // Proxy server — companion app talks to this, this talks to Gemini (primary)
-// with automatic fallback to Groq, plus live cricket data injection via CricketData.org.
-// Deploy on Render. Set GEMINI_API_KEY, GROQ_API_KEY, CRICKET_API_KEY as
-// environment variables in Render's dashboard — do not hardcode them here.
+// with automatic fallback chain: Gemini -> Groq -> OpenRouter -> Mistral.
+// Plus live cricket data injection via CricketData.org.
+// Deploy on Render. Set these env vars in Render's dashboard:
+// GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY, MISTRAL_API_KEY, CRICKET_API_KEY
 
 const express = require("express");
 const cors = require("cors");
@@ -17,20 +18,19 @@ const GEMINI_MODEL = "gemini-flash-latest";
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_MODEL = "llama-3.3-70b-versatile";
 
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free";
+
+const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
+const MISTRAL_MODEL = "mistral-small-latest";
+
 const CRICKET_API_KEY = process.env.CRICKET_API_KEY;
 
 if (!GEMINI_API_KEY) {
   console.error("Missing GEMINI_API_KEY environment variable.");
   process.exit(1);
 }
-if (!GROQ_API_KEY) {
-  console.warn("Missing GROQ_API_KEY — fallback will be unavailable if Gemini is rate-limited.");
-}
-if (!CRICKET_API_KEY) {
-  console.warn("Missing CRICKET_API_KEY — cricket data injection will be skipped.");
-}
 
-// Simple keyword check — catches most cricket questions without wasting API calls
 function isCricketQuery(text) {
   if (!text) return false;
   const keywords = ["cricket", "ipl", "odi", "t20", "test match", "wicket", "over", "run rate",
@@ -48,7 +48,6 @@ async function fetchCricketContext() {
     const data = await response.json();
     if (!data.data || data.data.length === 0) return null;
 
-    // Keep it compact — just the essentials for a handful of live/recent matches
     const summary = data.data.slice(0, 5).map((m) => {
       const teams = (m.teams || []).join(" vs ");
       const score = (m.score || [])
@@ -74,14 +73,11 @@ async function callGemini(system, messages, max_tokens) {
     `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
     {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-goog-api-key": GEMINI_API_KEY,
-      },
+      headers: { "Content-Type": "application/json", "X-goog-api-key": GEMINI_API_KEY },
       body: JSON.stringify({
         system_instruction: { parts: [{ text: system }] },
         contents,
-        generationConfig: { maxOutputTokens: max_tokens || 2000 },
+        generationConfig: { maxOutputTokens: max_tokens || 1200 },
         safetySettings: [
           { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_ONLY_HIGH" },
           { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_ONLY_HIGH" },
@@ -93,7 +89,6 @@ async function callGemini(system, messages, max_tokens) {
   );
 
   const data = await response.json();
-
   if (data.error) {
     const code = data.error.code;
     const msg = (data.error.message || "").toLowerCase();
@@ -114,8 +109,9 @@ async function callGemini(system, messages, max_tokens) {
   return parts.map((p) => p.text || "").join("").trim();
 }
 
-async function callGroq(system, messages, max_tokens) {
-  const groqMessages = [
+// Generic helper for OpenAI-compatible chat APIs (Groq, OpenRouter, Mistral)
+async function callOpenAiCompatible(url, apiKey, model, system, messages, max_tokens, extraHeaders) {
+  const chatMessages = [
     { role: "system", content: system || "" },
     ...(messages || []).map((m) => ({
       role: m.role === "assistant" ? "assistant" : "user",
@@ -123,30 +119,35 @@ async function callGroq(system, messages, max_tokens) {
     })),
   ];
 
-  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+  const response = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${GROQ_API_KEY}`,
+      Authorization: `Bearer ${apiKey}`,
+      ...(extraHeaders || {}),
     },
-    body: JSON.stringify({
-      model: GROQ_MODEL,
-      messages: groqMessages,
-      max_tokens: max_tokens || 2000,
-    }),
+    body: JSON.stringify({ model, messages: chatMessages, max_tokens: max_tokens || 1200 }),
   });
 
   const data = await response.json();
-  if (data.error) throw new Error(data.error.message || "Groq API error");
+  if (data.error) throw new Error(data.error.message || data.error || "API error");
 
   const choice = data.choices && data.choices[0];
   return choice && choice.message ? (choice.message.content || "").trim() : "";
 }
 
+const callGroq = (system, messages, max_tokens) =>
+  callOpenAiCompatible("https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY, GROQ_MODEL, system, messages, max_tokens);
+
+const callOpenRouter = (system, messages, max_tokens) =>
+  callOpenAiCompatible("https://openrouter.ai/api/v1/chat/completions", OPENROUTER_API_KEY, OPENROUTER_MODEL, system, messages, max_tokens);
+
+const callMistral = (system, messages, max_tokens) =>
+  callOpenAiCompatible("https://api.mistral.ai/v1/chat/completions", MISTRAL_API_KEY, MISTRAL_MODEL, system, messages, max_tokens);
+
 app.post("/chat", async (req, res) => {
   let { system, messages, max_tokens } = req.body;
 
-  // If the latest user message looks cricket-related, pull in live data
   const lastUserMsg = [...(messages || [])].reverse().find((m) => m.role === "user");
   if (lastUserMsg && isCricketQuery(lastUserMsg.content)) {
     const cricketInfo = await fetchCricketContext();
@@ -155,24 +156,44 @@ app.post("/chat", async (req, res) => {
     }
   }
 
+  const errors = [];
+
   try {
     const reply = await callGemini(system, messages, max_tokens);
     return res.json({ reply, provider: "gemini" });
   } catch (e) {
-    if (e.isSafetyBlock) {
-      return res.status(500).json({ error: e.message });
-    }
-    if (e.isRateLimit && GROQ_API_KEY) {
-      console.warn("Gemini rate-limited, falling back to Groq...");
-      try {
-        const reply = await callGroq(system, messages, max_tokens);
-        return res.json({ reply, provider: "groq" });
-      } catch (groqErr) {
-        return res.status(500).json({ error: `Both providers failed. Gemini: ${e.message} | Groq: ${groqErr.message}` });
-      }
-    }
-    return res.status(500).json({ error: e.message || "Proxy error" });
+    errors.push(`Gemini: ${e.message}`);
+    if (e.isSafetyBlock) return res.status(500).json({ error: e.message });
   }
+
+  if (GROQ_API_KEY) {
+    try {
+      const reply = await callGroq(system, messages, max_tokens);
+      return res.json({ reply, provider: "groq" });
+    } catch (e) {
+      errors.push(`Groq: ${e.message}`);
+    }
+  }
+
+  if (OPENROUTER_API_KEY) {
+    try {
+      const reply = await callOpenRouter(system, messages, max_tokens);
+      return res.json({ reply, provider: "openrouter" });
+    } catch (e) {
+      errors.push(`OpenRouter: ${e.message}`);
+    }
+  }
+
+  if (MISTRAL_API_KEY) {
+    try {
+      const reply = await callMistral(system, messages, max_tokens);
+      return res.json({ reply, provider: "mistral" });
+    } catch (e) {
+      errors.push(`Mistral: ${e.message}`);
+    }
+  }
+
+  return res.status(500).json({ error: `All providers failed. ${errors.join(" | ")}` });
 });
 
 const PORT = process.env.PORT || 3000;
