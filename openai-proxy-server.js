@@ -1,7 +1,7 @@
 // Proxy server — companion app talks to this, this talks to Gemini (primary)
-// with automatic fallback to Groq if Gemini is rate-limited.
-// Deploy on Render. Set GEMINI_API_KEY and GROQ_API_KEY as environment
-// variables in Render's dashboard — do not hardcode them here.
+// with automatic fallback to Groq, plus live cricket data injection via CricketData.org.
+// Deploy on Render. Set GEMINI_API_KEY, GROQ_API_KEY, CRICKET_API_KEY as
+// environment variables in Render's dashboard — do not hardcode them here.
 
 const express = require("express");
 const cors = require("cors");
@@ -17,12 +17,51 @@ const GEMINI_MODEL = "gemini-flash-latest";
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_MODEL = "llama-3.3-70b-versatile";
 
+const CRICKET_API_KEY = process.env.CRICKET_API_KEY;
+
 if (!GEMINI_API_KEY) {
   console.error("Missing GEMINI_API_KEY environment variable.");
   process.exit(1);
 }
 if (!GROQ_API_KEY) {
   console.warn("Missing GROQ_API_KEY — fallback will be unavailable if Gemini is rate-limited.");
+}
+if (!CRICKET_API_KEY) {
+  console.warn("Missing CRICKET_API_KEY — cricket data injection will be skipped.");
+}
+
+// Simple keyword check — catches most cricket questions without wasting API calls
+function isCricketQuery(text) {
+  if (!text) return false;
+  const keywords = ["cricket", "ipl", "odi", "t20", "test match", "wicket", "over", "run rate",
+    "world cup", "bcci", "icc", "batting", "bowling", "innings", "stump", "boundary"];
+  const lower = text.toLowerCase();
+  return keywords.some((k) => lower.includes(k));
+}
+
+async function fetchCricketContext() {
+  if (!CRICKET_API_KEY) return null;
+  try {
+    const response = await fetch(
+      `https://api.cricapi.com/v1/currentMatches?apikey=${CRICKET_API_KEY}&offset=0`
+    );
+    const data = await response.json();
+    if (!data.data || data.data.length === 0) return null;
+
+    // Keep it compact — just the essentials for a handful of live/recent matches
+    const summary = data.data.slice(0, 5).map((m) => {
+      const teams = (m.teams || []).join(" vs ");
+      const score = (m.score || [])
+        .map((s) => `${s.inning}: ${s.r}/${s.w} (${s.o} ov)`)
+        .join(", ");
+      return `${m.name || teams} — Status: ${m.status}${score ? " — " + score : ""}`;
+    }).join("\n");
+
+    return summary;
+  } catch (e) {
+    console.error("Cricket API fetch failed:", e.message);
+    return null;
+  }
 }
 
 async function callGemini(system, messages, max_tokens) {
@@ -42,7 +81,7 @@ async function callGemini(system, messages, max_tokens) {
       body: JSON.stringify({
         system_instruction: { parts: [{ text: system }] },
         contents,
-        generationConfig: { maxOutputTokens: max_tokens || 4000 },
+        generationConfig: { maxOutputTokens: max_tokens || 2000 },
         safetySettings: [
           { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_ONLY_HIGH" },
           { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_ONLY_HIGH" },
@@ -93,7 +132,7 @@ async function callGroq(system, messages, max_tokens) {
     body: JSON.stringify({
       model: GROQ_MODEL,
       messages: groqMessages,
-      max_tokens: max_tokens || 4000,
+      max_tokens: max_tokens || 2000,
     }),
   });
 
@@ -105,7 +144,16 @@ async function callGroq(system, messages, max_tokens) {
 }
 
 app.post("/chat", async (req, res) => {
-  const { system, messages, max_tokens } = req.body;
+  let { system, messages, max_tokens } = req.body;
+
+  // If the latest user message looks cricket-related, pull in live data
+  const lastUserMsg = [...(messages || [])].reverse().find((m) => m.role === "user");
+  if (lastUserMsg && isCricketQuery(lastUserMsg.content)) {
+    const cricketInfo = await fetchCricketContext();
+    if (cricketInfo) {
+      system = `${system || ""}\n\nLive cricket data (use this if relevant to the user's question, current as of now):\n${cricketInfo}`;
+    }
+  }
 
   try {
     const reply = await callGemini(system, messages, max_tokens);
