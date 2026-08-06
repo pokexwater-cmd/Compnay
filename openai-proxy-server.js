@@ -1,10 +1,10 @@
 // Proxy server — companion app talks to this, this talks to Gemini (primary)
 // with automatic fallback chain: Gemini -> Groq -> OpenRouter -> Mistral.
-// Plus live cricket data (CricketData.org) and general web search (Tavily)
-// injected into context for relevant questions.
+// Plus live cricket data (CricketData.org), general web search (Tavily),
+// and persistent chat storage via Supabase.
 // Deploy on Render. Set these env vars in Render's dashboard:
 // GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY, MISTRAL_API_KEY,
-// CRICKET_API_KEY, TAVILY_API_KEY
+// CRICKET_API_KEY, TAVILY_API_KEY, SUPABASE_URL, SUPABASE_KEY
 
 const express = require("express");
 const cors = require("cors");
@@ -29,6 +29,9 @@ const MISTRAL_MODEL = "mistral-small-latest";
 const CRICKET_API_KEY = process.env.CRICKET_API_KEY;
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+
 if (!GEMINI_API_KEY) {
   console.error("Missing GEMINI_API_KEY environment variable.");
   process.exit(1);
@@ -38,6 +41,9 @@ if (!OPENROUTER_API_KEY) console.warn("Missing OPENROUTER_API_KEY — that fallb
 if (!MISTRAL_API_KEY) console.warn("Missing MISTRAL_API_KEY — that fallback step will be skipped.");
 if (!CRICKET_API_KEY) console.warn("Missing CRICKET_API_KEY — cricket match data will be skipped.");
 if (!TAVILY_API_KEY) console.warn("Missing TAVILY_API_KEY — web search context will be skipped.");
+if (!SUPABASE_URL || !SUPABASE_KEY) console.warn("Missing SUPABASE_URL/SUPABASE_KEY — chat storage will be skipped.");
+
+// ---------- Cricket + Web search context ----------
 
 function isCricketQuery(text) {
   if (!text) return false;
@@ -102,6 +108,54 @@ async function fetchWebContext(query) {
     return null;
   }
 }
+
+// ---------- Supabase storage ----------
+// Expects a table called "messages" with columns:
+// id (auto), user_id (text), role (text), content (text), created_at (timestamptz, default now())
+
+async function saveMessage(userId, role, content) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return;
+  try {
+    await fetch(SUPABASE_URL + "/rest/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: SUPABASE_KEY,
+        Authorization: "Bearer " + SUPABASE_KEY,
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({
+        user_id: userId || "default_user",
+        role: role,
+        content: content,
+      }),
+    });
+  } catch (e) {
+    console.error("Supabase save failed:", e.message);
+  }
+}
+
+async function fetchHistory(userId, limit) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return [];
+  try {
+    const url = SUPABASE_URL + "/rest/v1/messages?user_id=eq." + encodeURIComponent(userId || "default_user") +
+      "&order=created_at.desc&limit=" + (limit || 50);
+    const response = await fetch(url, {
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: "Bearer " + SUPABASE_KEY,
+      },
+    });
+    const data = await response.json();
+    if (!Array.isArray(data)) return [];
+    return data.reverse();
+  } catch (e) {
+    console.error("Supabase fetch failed:", e.message);
+    return [];
+  }
+}
+
+// ---------- LLM providers ----------
 
 async function callGemini(system, messages, max_tokens) {
   const contents = (messages || []).map(function (m) {
@@ -191,10 +245,21 @@ function callMistral(system, messages, max_tokens) {
   return callOpenAiCompatible("https://api.mistral.ai/v1/chat/completions", MISTRAL_API_KEY, MISTRAL_MODEL, system, messages, max_tokens);
 }
 
+// ---------- Routes ----------
+
 app.post("/chat", async function (req, res) {
   let system = req.body.system;
-  const messages = req.body.messages;
+  let messages = req.body.messages;
   const max_tokens = req.body.max_tokens;
+  const userId = req.body.user_id || "default_user";
+
+  // If no history was sent by the client, try loading it from Supabase
+  if ((!messages || messages.length === 0) && SUPABASE_URL && SUPABASE_KEY) {
+    const stored = await fetchHistory(userId, 50);
+    messages = stored.map(function (m) {
+      return { role: m.role, content: m.content };
+    });
+  }
 
   const reversed = (messages || []).slice().reverse();
   let lastUserMsg = null;
@@ -217,11 +282,20 @@ app.post("/chat", async function (req, res) {
     }
   }
 
+  if (lastUserMsg) {
+    await saveMessage(userId, "user", lastUserMsg.content);
+  }
+
   const errors = [];
+
+  async function respond(reply, provider) {
+    await saveMessage(userId, "assistant", reply);
+    return res.json({ reply: reply, provider: provider });
+  }
 
   try {
     const reply = await callGemini(system, messages, max_tokens);
-    return res.json({ reply: reply, provider: "gemini" });
+    return respond(reply, "gemini");
   } catch (e) {
     errors.push("Gemini: " + e.message);
     if (e.isSafetyBlock) return res.status(500).json({ error: e.message });
@@ -230,7 +304,7 @@ app.post("/chat", async function (req, res) {
   if (GROQ_API_KEY) {
     try {
       const reply = await callGroq(system, messages, max_tokens);
-      return res.json({ reply: reply, provider: "groq" });
+      return respond(reply, "groq");
     } catch (e) {
       errors.push("Groq: " + e.message);
     }
@@ -239,7 +313,7 @@ app.post("/chat", async function (req, res) {
   if (OPENROUTER_API_KEY) {
     try {
       const reply = await callOpenRouter(system, messages, max_tokens);
-      return res.json({ reply: reply, provider: "openrouter" });
+      return respond(reply, "openrouter");
     } catch (e) {
       errors.push("OpenRouter: " + e.message);
     }
@@ -248,13 +322,20 @@ app.post("/chat", async function (req, res) {
   if (MISTRAL_API_KEY) {
     try {
       const reply = await callMistral(system, messages, max_tokens);
-      return res.json({ reply: reply, provider: "mistral" });
+      return respond(reply, "mistral");
     } catch (e) {
       errors.push("Mistral: " + e.message);
     }
   }
 
   return res.status(500).json({ error: "All providers failed. " + errors.join(" | ") });
+});
+
+// Fetch stored history for a user
+app.get("/history", async function (req, res) {
+  const userId = req.query.user_id || "default_user";
+  const history = await fetchHistory(userId, 100);
+  res.json({ history: history });
 });
 
 // Visit /health in your browser to test all providers at once
@@ -314,6 +395,17 @@ app.get("/health", async function (req, res) {
     results.tavily = w ? "working" : "failed or no results";
   } else {
     results.tavily = "no key set";
+  }
+
+  if (SUPABASE_URL && SUPABASE_KEY) {
+    try {
+      await saveMessage("health_check", "user", "ping");
+      results.supabase = "working";
+    } catch (e) {
+      results.supabase = "failed: " + e.message;
+    }
+  } else {
+    results.supabase = "no key set";
   }
 
   res.json(results);
