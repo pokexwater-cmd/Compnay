@@ -1,8 +1,10 @@
 // Proxy server — companion app talks to this, this talks to Gemini (primary)
 // with automatic fallback chain: Gemini -> Groq -> OpenRouter -> Mistral.
-// Plus live cricket data injection via CricketData.org.
+// Plus live cricket data (CricketData.org) and general web search (Tavily)
+// injected into context for relevant questions.
 // Deploy on Render. Set these env vars in Render's dashboard:
-// GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY, MISTRAL_API_KEY, CRICKET_API_KEY
+// GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY, MISTRAL_API_KEY,
+// CRICKET_API_KEY, TAVILY_API_KEY
 
 const express = require("express");
 const cors = require("cors");
@@ -19,12 +21,13 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_MODEL = "llama-3.3-70b-versatile";
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free";
+const OPENROUTER_MODEL = "openrouter/free";
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 const MISTRAL_MODEL = "mistral-small-latest";
 
 const CRICKET_API_KEY = process.env.CRICKET_API_KEY;
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 
 if (!GEMINI_API_KEY) {
   console.error("Missing GEMINI_API_KEY environment variable.");
@@ -33,14 +36,15 @@ if (!GEMINI_API_KEY) {
 if (!GROQ_API_KEY) console.warn("Missing GROQ_API_KEY — that fallback step will be skipped.");
 if (!OPENROUTER_API_KEY) console.warn("Missing OPENROUTER_API_KEY — that fallback step will be skipped.");
 if (!MISTRAL_API_KEY) console.warn("Missing MISTRAL_API_KEY — that fallback step will be skipped.");
-if (!CRICKET_API_KEY) console.warn("Missing CRICKET_API_KEY — cricket data injection will be skipped.");
+if (!CRICKET_API_KEY) console.warn("Missing CRICKET_API_KEY — cricket match data will be skipped.");
+if (!TAVILY_API_KEY) console.warn("Missing TAVILY_API_KEY — web search context will be skipped.");
 
 function isCricketQuery(text) {
   if (!text) return false;
   const keywords = ["cricket", "ipl", "odi", "t20", "test match", "wicket", "over", "run rate",
     "world cup", "bcci", "icc", "batting", "bowling", "innings", "stump", "boundary"];
   const lower = text.toLowerCase();
-  return keywords.some((k) => lower.includes(k));
+  return keywords.some(function (k) { return lower.indexOf(k) !== -1; });
 }
 
 async function fetchCricketContext() {
@@ -65,6 +69,36 @@ async function fetchCricketContext() {
     return summary;
   } catch (e) {
     console.error("Cricket API fetch failed:", e.message);
+    return null;
+  }
+}
+
+async function fetchWebContext(query) {
+  if (!TAVILY_API_KEY) return null;
+  try {
+    const response = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer " + TAVILY_API_KEY,
+      },
+      body: JSON.stringify({
+        query: query,
+        search_depth: "basic",
+        max_results: 3,
+      }),
+    });
+
+    const data = await response.json();
+    if (!data.results || data.results.length === 0) return null;
+
+    const summary = data.results.map(function (r) {
+      return r.title + ": " + r.content;
+    }).join("\n\n");
+
+    return summary;
+  } catch (e) {
+    console.error("Tavily fetch failed:", e.message);
     return null;
   }
 }
@@ -117,7 +151,6 @@ async function callGemini(system, messages, max_tokens) {
   return parts.map(function (p) { return p.text || ""; }).join("").trim();
 }
 
-// Generic helper for OpenAI-compatible chat APIs (Groq, OpenRouter, Mistral)
 async function callOpenAiCompatible(url, apiKey, model, system, messages, max_tokens) {
   const chatMessages = [
     { role: "system", content: system || "" },
@@ -175,7 +208,12 @@ app.post("/chat", async function (req, res) {
   if (lastUserMsg && isCricketQuery(lastUserMsg.content)) {
     const cricketInfo = await fetchCricketContext();
     if (cricketInfo) {
-      system = (system || "") + "\n\nLive cricket data (use this if relevant to the user's question, current as of now):\n" + cricketInfo;
+      system = (system || "") + "\n\nLive cricket match data (use this if relevant, current as of now):\n" + cricketInfo;
+    }
+
+    const webInfo = await fetchWebContext(lastUserMsg.content);
+    if (webInfo) {
+      system = (system || "") + "\n\nWeb search results (use this if it answers the question more precisely):\n" + webInfo;
     }
   }
 
@@ -269,6 +307,13 @@ app.get("/health", async function (req, res) {
     results.cricket = c ? "working" : "failed or no live matches";
   } else {
     results.cricket = "no key set";
+  }
+
+  if (TAVILY_API_KEY) {
+    const w = await fetchWebContext("test search");
+    results.tavily = w ? "working" : "failed or no results";
+  } else {
+    results.tavily = "no key set";
   }
 
   res.json(results);
